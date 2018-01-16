@@ -1,3 +1,6 @@
+PEP-C
+
+
 PEP: XXX
 Title: Module State Access from C Extension Methods
 Version: $Revision$
@@ -5,12 +8,13 @@ Last-Modified: $Date$
 Author: Petr Viktorin <encukou@gmail.com>,
         Nick Coghlan <ncoghlan@gmail.com>,
         Eric Snow <ericsnowcurrently@gmail.com>
+        Marcel Plch <gmarcel.plch@gmail.com>
 Discussions-To: import-sig@python.org
 Status: Active
 Type: Process
 Content-Type: text/x-rst
 Created: 02-Jun-2016
-Python-Version: 3.6
+Python-Version: 3.8
 Post-History:
 
 
@@ -28,12 +32,48 @@ This fixes one of the remaining roadblocks for adoption of PEP 3121 (Extension
 module initialization and finalization) and PEP 489
 (Multi-phase extension module initialization).
 
-Additionaly, support for easier creation of static exception classes is added.
+Additionaly, support for easier creation of immutable exception classes is added.
 This removes the need for keeping per-module state if it would only be used
 for exception classes.
 
 While this PEP takes an additional step towards fully solving the problems that PEP 3121 and PEP 489 started
 tackling, it does not attempt to resolve *all* remaining concerns. In particular, accessing the module state from slot methods (``nb_add``, etc) remains slower than accessing that state from other extension methods.
+
+
+Terminology
+===========
+
+Process-Global State
+--------------------
+
+C-level static variables. Since this is very low-level
+memory storage, it must be managed carefully.
+
+(XXX Use this term everywhere)
+
+Per-module State
+----------------
+
+State local to a module object, allocated dynamically as part of a
+module object's initialization. This isolates the state from other
+instances of the module (including those in other subinterpreters).
+
+Accessed by ``PyModule_GetState()``.
+
+
+Static Type
+-----------
+
+A type object defined as a C-level static variable, i.e. a compiled-in type object.
+
+A static type needs to be shared between module instances and has no
+information of what module it belongs to.
+Static types do not have ``__dict__`` (although their instances might).
+
+Heap Type
+---------
+
+A type object created at run time.
 
 
 Rationale
@@ -69,38 +109,35 @@ A faster, safer way of accessing module-level state from extension methods
 is needed.
 
 
-Static Exceptions
------------------
+Immutable Exception Types
+-------------------------
 
 For isolated modules to work, any class whose methods touch module state
-must be a heap class, so that each instance of a module can have its own
-class object.  With the changes proposed in this PEP, heap classes will
-provide access to module state without global registration.  But, to create
-instances of heap classes, one will need the module state in order to
-get the class object corresponding to the appropriate module object.
-Heap types are "viral" – anything that “touches” them must itself be
+must be a heap type, so that each instance of a module can have its own
+type object.  With the changes proposed in this PEP, heap type instances will
+have access to module state without global registration.  But, to create
+instances of heap types, one will need the module state in order to
+get the type object corresponding to the appropriate module.
+In short, heap types are "viral" – anything that “touches” them must itself be
 a heap type.
 
 Curently, most exception types, apart from the ones in ``builtins``, are
 heap types.  This is likely simply because there is a convenient way
-to create them: ``PyErr_NewException``.  Most exceptions do not need to be
-heap types.  (It does give Python code the ability to add custom attributes
-to the exception class, but monkeypatching exception classes is not very
-useful).
-In some cases, heap exception types are harmful.  For example the ``sqlite``
-module currently uses C-global variables for the exceptions, so any time the
-module is loaded (e.g. from a subinterpreter), these pointers will be
-overwritten with freshly created classes. It seems like the module was
-written expecting ``PyErr_NewException`` to hand out static types – which
-is an assumption that someone casually reading the docs could very well form.
+to create them: ``PyErr_NewException``. 
+Heap types generally have a mutable ``__dict__``.
+In most cases, this mutability is harmful.  For example, exception types
+from the ``sqlite`` module are mutable and shared across subinterpreters.
+This allows "smuggling" values to other subinterpreters via attributes of
+``sqlite3.Error``.
 
-Moreover, since raising exception is a common operations, and heap types
+Moreover, since raising exceptions is a common operation, and heap types
 will be "viral", ``PyErr_NewException`` will tend to "infect" the module
 with "heap-type-ness" – at least if the module decides play well with
-subinterpreters/isolation.  Many modules could go without module state
-entirely if the exception classes were static.
+subinterpreters/isolation.
+Many modules could go without module state
+entirely if the exception classes were immutable.
 
-To solve this problem, a new function for creating static exception types
+To solve this problem, a new function for creating immutable exception types
 is proposed.
 
 
@@ -133,21 +170,23 @@ In Python code, the Python-level equivalents may be retrieved as::
     The defining class is not ``type(self)``, since ``type(self)`` might
     be a subclass of ``Foo``.
 
-Implicitly, the last three of those rely on name-based lookup via the function's ``__globals__`` attribute:
+Implicitly, the last three of those rely on name-based lookup via the function's ``__globals__``:
 either the ``Foo`` attribute to access the defining class and Python function object, or ``__name__`` to find the module object in ``sys.modules``.
 In Python code, this is feasible, as ``__globals__`` is set appropriately when the function definition is executed, and
 even if the namespace has been manipulated to return a different object, at worst an exception will be raised.
 
-By contrast, extension methods are typically implemented as normal C functions. This means that they only have access to their arguments, and any C level thread local and process global state. Traditionally, many extension modules have stored
-their shared state in C level process globals, causing problems when:
+By contrast, extension methods are typically implemented as normal C functions.
+This means that they only have access to their arguments and C level thread-local
+and process-global states. Traditionally, many extension modules have stored
+their shared state in C-level process globals, causing problems when:
     
     * running multiple initialize/finalize cycles in the same process
     * reloading modules (e.g. to test conditional imports)
     * loading extension modules in subinterpreters
 
-PEP 3121 attempted to resolve this by offering the ``PyState_FindModule`` API, but this still had significant problems when it comes to extension methods (rather than module level functions):
+PEP 3121 attempted to resolve this by offering the ``PyState_FindModule`` API, but this still has significant problems when it comes to extension methods (rather than module level functions):
 
-    * it is markedly slower than directly accessing C level process global state
+    * it is markedly slower than directly accessing C-level process-global state
     * there is still some inherent reliance on process global state that means it still doesn't reliably handle module reloading
 
 It's also the case that when looking up a C-level struct such as module state, supplying
@@ -173,16 +212,14 @@ using them:
     * Pass the defining class to the underlying C function.
 
       The defining class is readily available at the time built-in
-      method objects (``PyCFunctionObject``) are created, so it can be stored
+      method object (``PyCFunctionObject``) is created, so it can be stored
       in a new struct that extends ``PyCFunctionObject``.
 
 The module state can then be retrieved from the module object via
 ``PyModule_GetState``.
 
 Note that this proposal implies that any type whose method needs to access
-module-global state must be a heap type dynamically created during extension
-module initialisation, rather than a static type predefined when the extension
-module is compiled.
+per-module state must be a heap type, rather than a static type.
 
 This is necessary to support loading multiple module objects from a single
 extension: a static type, as a C-level global, has no information about
@@ -208,14 +245,22 @@ Two possible solutions have been proposed to this problem:
 Due to the invasiveness of the latter approach, this PEP proposes adding a MRO walking helper for use in slot method implementations, deferring the more complex alternative as a potential future optimisation.
 
 
-Static Exceptions
------------------
+Immutable Exception Types
+-------------------------
 
 To faciliate creating static exception classes, a new function is proposed:
-``PyErr_PrepareStaticException``. It will work similarly to
-``PyErr_NewExceptionWithDoc``, but it will take a pre-allocated, zero-filled
-``PyTypeObject``, fill it with the provided info, and call ``PyType_Ready``
-on it.
+``PyErr_PrepareImmutableException``. It will work similarly to ``PyErr_NewExceptionWithDoc``
+but will take a ``PyTypeObject **`` pointer, which points to a ``PyTypeObject *`` that is
+either ``NULL`` or an initialized ``PyTypeObject``.
+This pointer may be declared in process-global state. The function will then
+allocate the object and will keep in mind that already existing exception
+should not be overwritten.
+
+(XXX: Update function name in the implementation)
+
+The extra indirection makes it possible to make ``PyErr_PrepareImmutableException``
+part of the stable ABI by having the Python interpreter, rather than extension code,
+allocate the ``PyTypeObject``.
 
 
 Specification
@@ -229,9 +274,6 @@ that can store a pointer to the module object for which the type was defined.
 It will be ``NULL`` by default, and should not be modified after the type
 object is created.
 
-A new flag, ``Py_TPFLAGS_HAVE_MODULE``, will be set on any type object where
-the ``ht_module`` member is present and non-NULL.
-
 A new factory method will be added for creating modules::
 
     PyObject* PyType_FromModuleAndSpec(PyObject *module,
@@ -243,14 +285,15 @@ This acts the same as ``PyType_FromSpecWithBases``, and additionally sets
 
 Additionally, an accessor, ``PyObject * PyType_GetModule(PyTypeObject *)``
 will be provided.
-It will return the ``ht_module`` if a heap type with Py_TPFLAGS_HAVE_MODULE is passed in,
-otherwise it will set a SystemError and return NULL.
+It will return the ``ht_module`` if a heap type with module pointer set
+is passed in, otherwise it will set a SystemError and return NULL.
 
 Usually, creating a class with ``ht_module`` set will create a reference
 cycle involving the class and the module.
 This is not a problem, as tearing down modules is not a performance-sensitive
-operation.
-Module-level functions typically also create reference cycles.
+operation (and module-level functions typically also create reference cycles).
+The existing "set all module globals to None" code that breaks function cycles
+through ``f_globals`` will also break the new cycles through ``ht_module``.
 
 
 Passing the defining class to extension methods
@@ -282,7 +325,7 @@ Argument Clinic
 ---------------
 
 To support passing the defining class to methods using Argument Clinic,
-a new converter will be added to clinic.py: ``definitng_class``.
+a new converter will be added to clinic.py: ``defining_class``.
 
 Each method may only have one argument using this converter, and it must
 appear after ``self``, or, if ``self`` is not used, as the first argument.
@@ -292,11 +335,28 @@ When used, Argument Clinic will select ``METH_METHOD`` as the calling
 convention.
 The argument will not appear in ``__text_signature__``.
 
+This will be compatible with ``__init__`` and ``__new__`` methods, where an
+MRO walker will be used to pass the defining class from clinic generated
+code to the user's function.
+
 
 Slot methods
 ------------
 
-XXX: Exact API TBD
+To allow access to per-module state from slot methods, an MRO walker
+will be implemented::
+
+    PyTypeObject *PyType_DefiningTypeFromSlotFunc(PyTypeObject *type,
+                                                  int slot, void *func)
+
+The walker will go through bases of heap-allocated ``type``
+and search for class that defines ``func`` at its ``slot``.
+
+The ``func`` needs not to be inherited by ``type``, only requirement
+for the walker to find the defining class is that the defining class
+must be heap-allocated.
+
+On failure, exception is set and NULL is returned.
 
 
 Static exceptions
@@ -304,36 +364,54 @@ Static exceptions
 
 A new function will be added::
 
-    PyTypeObject * PyErr_PrepareStaticException(PyTypeObject *exc,
-                                                const char *name,
-                                                const char *doc,
-                                                PyObject *base)
+    int PyErr_PrepareImmutableException(PyTypeObject **exc,
+                                     const char *name,
+                                     const char *doc,
+                                     PyObject *base)
 
-Given a zero-filled exception type ``exc``, it will fill that object's
-``tp_name``, ``tp_doc`` and ``tp_base`` with the provided information.
+Creates an immutable exception type which can be shared
+across multiple module objects.
+If the type already exists (determined by a process-global pointer,
+``*exc``), skip the initialization and only ``INCREF`` it.
+
+If ``*exc`` is NULL, the function will
+allocate a new exception type and initialize it using given parameters
+the same way ``PyType_FromSpecAndBases`` would.
 The ``doc`` and ``base`` arguments may be ``NULL``, defaulting to a
 missing docstring and ``PyExc_Exception`` base class, respectively.
 The exception type's ``tp_flags`` will be set to values common to
-built-in exceptions.
-After filling these slots, the function will call ``PyType_Ready`` on
-the exception class, and return it.
-On failure, ``PyErr_PrepareStaticException`` will set an exception
-and return NULL.
+built-in exceptions and the ``Py_TPFLAGS_HEAP_IMMUTABLE`` flag (see below)
+will be set.
+On failure, ``PyErr_PrepareImmutableException`` will set an exception
+and return -1.
 
-If called with an initialized exception type (determined by ``Py_TYPE(exc)``
-being non-NULL), the function will do nothing but return ``exc``.
+If called with an initialized exception type (``*exc``
+is non-NULL), the function will do nothing but incref ``*exc``.
 
-The function will not be part of the stable ABI, since it needs the module
-to pre-allocate a ``PyTypeObject``.
+(XXX: Support and test multiple inheritance)
 
-Since heap types do not support multiple inheritance, the function will
-only allow a single type for ``base``.
+A new flag, ``Py_TPFLAGS_HEAP_IMMUTABLE``, will be added to prevent
+mutation of the type object. This makes it possible to
+share the object safely between multiple interpreters.
+This flag is checked in setattr (XXX: name of C function?) and blocks
+setting of attributes when set, similar to built-in types.
+
+A new pointer, ``ht_moduleptr``, will be added to heap types to store ``exc``.
+
+(XXX: better name? Update implementation)
+
+On deinitialization of the exception type, ``*exc`` will be set to ``NULL``.
+This makes it safe for
+``PyErr_PrepareImmutableException`` to check if the exception
+was already initialized.
 
 
 Helpers
 -------
 
 XXX: I'd like to port a bunch of modules to see what helpers would be convenient
+
+XXX: Helper for getting module state directly from defining class
 
 
 Modules Converted in the Initial Implementation
@@ -342,11 +420,8 @@ Modules Converted in the Initial Implementation
 To validate the approach, several modules will be modified during
 the initial implementation:
 
-The ``_sqlite``, ``_pickle``, ``_elementtree``, ``_curses_panel`` and
-``_csv`` modules will be switched to use static exception types.
-
-XXX: Module state
-
+The ``zipimport``, ``_io``, ``_elementtree``, and ``_csv`` modules
+will be ported to PEP 489 multiphase initialization.
 
 
 Summary of API Changes and Additions
@@ -358,10 +433,10 @@ XXX, see above for now
 Backwards Compatibility
 =======================
 
-One new pointer is added to all heap types.
-All other changes are adding new functions and structures.
+Two new pointers are added to all heap types.
+All other changes are adding new functions, structures and a type flag.
 
-The new ``PyErr_PrepareStaticException`` function changes encourages
+The new ``PyErr_PrepareImmutableException`` function changes encourages
 modules to switch from using heap-type Exception classes to static ones,
 and a number of modules will be switched in the initial implementation.
 This change will prevent adding class attributes to such types.
@@ -370,7 +445,6 @@ For example, the following will raise AttributeError::
     sqlite.OperationalError.foo = None
 
 Instances and subclasses of such exceptions will not be affected.
-
 
 Implementation
 ==============
@@ -385,7 +459,7 @@ Possible Future Extensions
 Easy creation of types with module references
 ---------------------------------------------
 
-It would be possible to add a PEP 489 execution slot type make
+It would be possible to add a PEP 489 execution slot type to make
 creating heap types significantly easier than calling
 ``PyType_FromModuleAndSpec``.
 This is left to a future PEP.
@@ -408,10 +482,10 @@ References
    (https://mail.python.org/pipermail/import-sig/2015-July/001035.html)
 
 .. [#gh-repo]
-   https://github.com/encukou/cpython/commits/module-state-access
+   https://github.com/Traceur759/cpython/commits/pep-c
 
 .. [#gh-patch]
-   https://github.com/encukou/cpython/compare/master...encukou:module-state-access.patch
+   https://github.com/Traceur759/cpython/compare/master...Traceur759:pep-c.patch
 
 
 Copyright
@@ -420,7 +494,7 @@ Copyright
 This document has been placed in the public domain.
 
 
-
+
 ..
    Local Variables:
    mode: indented-text
@@ -429,4 +503,3 @@ This document has been placed in the public domain.
    fill-column: 70
    coding: utf-8
    End:
-
